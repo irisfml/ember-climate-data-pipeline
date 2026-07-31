@@ -1,74 +1,54 @@
 import os
-import requests
 import pandas as pd
 import duckdb
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
-
-EMBER_API_KEY = os.getenv("EMBER_API_KEY")
 DB_PATH = "data/ember_climate.db"
+# Direct URL to official Ember yearly electricity generation dataset
+EMBER_DATA_URL = "https://files.ember-energy.org/public-downloads/generation/outputs/release_generation_yearly_global.csv"
 
-def fetch_ember_data(entity_code="BRA", series_id="gen", year_from=2015):
+def fetch_ember_data_from_url():
     """
-    Fetches electricity generation and emissions data from the Ember API.
+    Downloads official global yearly electricity dataset directly from Ember file storage.
+    Filters the dataset for Brazil to maintain an optimized staging layer.
+    """
+    print(f"Downloading official Ember dataset directly from storage...")
     
-    :param entity_code: ISO 3-letter country code (e.g., 'BRA' for Brazil, 'USA', 'DEU')
-    :param series_id: Metrics series ('gen' for generation, 'emissions' for carbon emissions)
-    :param year_from: Starting year for historical analysis
-    """
-    if not EMBER_API_KEY:
-        raise ValueError("EMBER_API_KEY is not set in the environment variables.")
+    # Pandas reads the CSV directly from the HTTP URL
+    df = pd.read_csv(EMBER_DATA_URL)
+    
+    # Filter for Brazil to keep local staging light for development
+    df_brazil = df[df["Area"] == "Brazil"].copy()
+    
+    print(f"Successfully downloaded {len(df_brazil)} rows for Brazil.")
+    return df_brazil
 
-    url = "https://api.ember-climate.org/v1/electricity-generation/yearly"
-    
-    params = {
-        "api_key": EMBER_API_KEY,
-        "entity_code": entity_code,
-        "start_date": year_from
-    }
-    
-    print(f"Fetching Ember Climate data for entity: {entity_code}...")
-    response = requests.get(url, params=params)
-    
-    if response.status_code == 200:
-        data = response.json()
-        results = data.get("data", [])
-        print(f"Successfully retrieved {len(results)} records.")
-        return results
-    else:
-        raise Exception(f"API request failed with status code {response.status_code}: {response.text}")
-
-def save_raw_to_duckdb(records):
+def save_raw_to_duckdb(df):
     """
-    Saves raw API records directly into a DuckDB raw staging table.
+    Saves raw records directly into a DuckDB staging table following ELT architecture.
     """
-    if not records:
+    if df.empty:
         print("No records to save.")
         return
 
-    # Convert raw JSON records to Pandas Dataframe
-    df = pd.DataFrame(records)
+    # Ensure local data directory exists
+    os.makedirs("data", exist_ok=True)
     
-    # Connect to DuckDB (creates the file if it doesn't exist)
+    # Connect to DuckDB (creates local file if missing)
     conn = duckdb.connect(DB_PATH)
     
-    # Save raw records into a raw staging table (Replacing old staging for fresh loads)
-    conn.execute("CREATE TABLE IF NOT EXISTS raw_electricity_generation AS SELECT * FROM df WHERE 1=0;")
+    # Register DataFrame and overwrite raw staging table
     conn.register("df_view", df)
     conn.execute("CREATE OR REPLACE TABLE raw_electricity_generation AS SELECT * FROM df_view;")
     
-    # Query count to verify insertion
+    # Validate count
     count = conn.execute("SELECT COUNT(*) FROM raw_electricity_generation;").fetchone()[0]
-    print(f"Raw data successfully loaded into DuckDB. Total rows: {count}")
+    print(f"Raw data successfully loaded into DuckDB ({DB_PATH}). Total rows in staging: {count}")
     
     conn.close()
 
 if __name__ == "__main__":
     try:
-        # Fetch data for Brazil as initial test case
-        raw_data = fetch_ember_data(entity_code="BRA", year_from=2015)
-        save_raw_to_duckdb(raw_data)
+        raw_df = fetch_ember_data_from_url()
+        save_raw_to_duckdb(raw_df)
     except Exception as e:
         print(f"Extraction Pipeline Error: {e}")

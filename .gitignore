@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Local data and secrets
+data/
+*.db
+*.sqlite
+.env
+
+# Mac system files
+.DS_Store
+
+# Python virtual environment
+venv/
+.venv/
