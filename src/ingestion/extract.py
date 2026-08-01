@@ -1,54 +1,71 @@
 import os
 import pandas as pd
+import requests
 import duckdb
+from .config import DATA_URL, DB_PATH, RAW_TABLE_NAME, TARGET_COUNTRY
+from .logger import setup_logger
 
-DB_PATH = "data/ember_climate.db"
-# Direct URL to official Ember yearly electricity generation dataset
-EMBER_DATA_URL = "https://files.ember-energy.org/public-downloads/generation/outputs/release_generation_yearly_global.csv"
+logger = setup_logger("extract_module")
 
-def fetch_ember_data_from_url():
+def fetch_data(url: str) -> pd.DataFrame:
     """
-    Downloads official global yearly electricity dataset directly from Ember file storage.
-    Filters the dataset for Brazil to maintain an optimized staging layer.
+    Fetches raw CSV data. Uses a local fallback if the web request fails or is blocked.
     """
-    print(f"Downloading official Ember dataset directly from storage...")
+    logger.info(f"Attempting connection to API endpoint: {url}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     
-    # Pandas reads the CSV directly from the HTTP URL
-    df = pd.read_csv(EMBER_DATA_URL)
-    
-    # Filter for Brazil to keep local staging light for development
-    df_brazil = df[df["Area"] == "Brazil"].copy()
-    
-    print(f"Successfully downloaded {len(df_brazil)} rows for Brazil.")
-    return df_brazil
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+        logger.info("Data fetched successfully from source. Parsing CSV payload...")
+        return pd.read_csv(pd.io.common.BytesIO(response.content))
+    except Exception as e:
+        logger.warning(f"Web source unavailable or blocked ({e}). Activating resilience fallback...")
+        local_path = "data/raw_ember_data.csv"
+        
+        if os.path.exists(local_path):
+            logger.info(f"Successfully loaded dataset from local fallback: {local_path}")
+            return pd.read_csv(local_path)
+        else:
+            logger.error("Critical: Local fallback file not found in 'data/' folder.")
+            raise
 
-def save_raw_to_duckdb(df):
+def load_to_duckdb(df: pd.DataFrame, db_path: str, table_name: str) -> None:
     """
-    Saves raw records directly into a DuckDB staging table following ELT architecture.
+    Loads filtered DataFrame into DuckDB raw table idempotently.
+    Dynamically identifies country column ('Country / Area', 'Area', 'Country / Territory', or 'Country').
     """
-    if df.empty:
-        print("No records to save.")
+    logger.info(f"Filtering dataset for target country: {TARGET_COUNTRY}")
+    
+    # Identify country column dynamically based on payload schema
+    possible_country_cols = ['Country / Area', 'Area', 'Country / Territory', 'Country', 'country', 'area']
+    country_col = None
+    
+    for col in possible_country_cols:
+        if col in df.columns:
+            country_col = col
+            break
+            
+    if not country_col:
+        raise KeyError(f"Could not find country column in DataFrame. Available columns: {list(df.columns)}")
+    
+    logger.info(f"Using country column: '{country_col}'")
+    df_filtered = df[df[country_col] == TARGET_COUNTRY].copy()
+    
+    if df_filtered.empty:
+        logger.warning(f"No records found for country: {TARGET_COUNTRY}")
         return
 
-    # Ensure local data directory exists
-    os.makedirs("data", exist_ok=True)
-    
-    # Connect to DuckDB (creates local file if missing)
-    conn = duckdb.connect(DB_PATH)
-    
-    # Register DataFrame and overwrite raw staging table
-    conn.register("df_view", df)
-    conn.execute("CREATE OR REPLACE TABLE raw_electricity_generation AS SELECT * FROM df_view;")
-    
-    # Validate count
-    count = conn.execute("SELECT COUNT(*) FROM raw_electricity_generation;").fetchone()[0]
-    print(f"Raw data successfully loaded into DuckDB ({DB_PATH}). Total rows in staging: {count}")
-    
-    conn.close()
-
-if __name__ == "__main__":
+    logger.info(f"Connecting to DuckDB target database at: {db_path}")
     try:
-        raw_df = fetch_ember_data_from_url()
-        save_raw_to_duckdb(raw_df)
-    except Exception as e:
-        print(f"Extraction Pipeline Error: {e}")
+        conn = duckdb.connect(db_path)
+        conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df_filtered")
+        
+        record_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        logger.info(f"Successfully loaded {record_count} records into '{table_name}' table.")
+        conn.close()
+    except duckdb.Error as e:
+        logger.error(f"Database operation failed: {e}")
+        raise
